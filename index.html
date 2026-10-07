@@ -150,13 +150,22 @@
   <p class="sub">60초마다 자동 갱신 · 최대 ~2분 지연 가능</p>
   <dl>
     <dt>수신 시각(UTC)</dt><dd id="v-ts">—</dd>
+    <dt>기록 주기</dt><dd><select id="sample-interval" aria-label="예상 기록 주기">
+      <option value="60">60초</option>
+      <option value="120">120초</option>
+      <option value="180" selected>180초</option>
+    </select></dd>
+    <dt>다음 기록 예상</dt><dd id="v-next">—</dd>
     <dt>RSRP</dt><dd id="v-rsrp">—</dd>
     <dt>RSRQ</dt><dd id="v-rsrq">—</dd>
     <dt>RSSI</dt><dd id="v-rssi">—</dd>
     <dt>위성 수</dt><dd id="v-sats">—</dd>
+    <dt>GNSS 고도(해발)</dt><dd id="v-alt">—</dd>
+    <dt>HDOP</dt><dd id="v-hdop">—</dd>
     <dt>GPS 픽스</dt><dd id="v-fix">—</dd>
     <dt>등록 상태</dt><dd id="v-reg">—</dd>
   </dl>
+  <p class="sub">남은 시간은 최신 기록 기준 예상치입니다. GNSS 수신·업로드에 따라 달라집니다. 주기 선택은 로거 설정을 변경하지 않습니다.</p>
   <div class="pos" id="v-pos">위치 없음</div>
 </aside>
 
@@ -199,6 +208,7 @@ let trackLine = null;
 let latestMarker = null;
 let fitted = false;
 let hasData = false;
+let latestSampleMs = NaN;
 
 /* ================= 유틸 ================= */
 function $(id) { return document.getElementById(id); }
@@ -293,15 +303,24 @@ function markerRadius(hdop) {
   return Math.min(18, Math.max(6, 5 + (h === null ? 1 : h) * 1.5));
 }
 
+function fmtAltitude(record) {
+  if (num(record.fix) === 2) return '미확정 (2D fix)';
+  return num(record.fix) === 3 ? fmt(record.alt_m, 'm', 1) : '—';
+}
+
 function updateView(records) {
   const latest = records[0];  // seq 내림차순 첫 행 = 최신
 
   /* 패널: 최신 행의 신호 값 — fix=0 행이어도 그대로 표시 */
   $('v-ts').textContent   = latest.ts_utc ? String(latest.ts_utc) : '—';
+  latestSampleMs = latest.ts_utc ? parseTs(latest.ts_utc) : NaN;
+  updateCountdown();
   $('v-rsrp').textContent = fmt(latest.rsrp_dbm, 'dBm');
   $('v-rsrq').textContent = fmt(latest.rsrq_db, 'dB', 1);
   $('v-rssi').textContent = fmt(latest.rssi_dbm, 'dBm');
   $('v-sats').textContent = fmt(latest.sats);
+  $('v-alt').textContent  = fmtAltitude(latest);
+  $('v-hdop').textContent = fmt(latest.hdop, '', 1);
   $('v-fix').textContent  = fmtFix(latest.fix);
   $('v-reg').textContent  = fmtReg(latest.reg_status);
 
@@ -327,7 +346,7 @@ function updateView(records) {
       className: 'latest-marker'
     }).addTo(map);
     latestMarker.bindTooltip(
-      '고도 ' + fmt(fixed[0].alt_m, 'm', 0) +
+      '해발 고도 ' + fmtAltitude(fixed[0]) +
       ' · 속도 ' + fmt(fixed[0].speed_kmh, 'km/h', 1) +
       ' · HDOP ' + fmt(fixed[0].hdop, '', 1),
       { direction: 'top', offset: [0, -8] }
@@ -360,6 +379,23 @@ function parseTs(s) {
   return isNaN(t) ? NaN : t;
 }
 
+function updateCountdown() {
+  if (!Number.isFinite(latestSampleMs)) {
+    $('v-next').textContent = '—';
+    return;
+  }
+  const now = Date.now();
+  if (latestSampleMs > now + 5000) {
+    $('v-next').textContent = '기록·기기 시각 확인 필요';
+    return;
+  }
+  const interval = Number($('sample-interval').value) * 1000;
+  const seconds = Math.ceil((latestSampleMs + interval - now) / 1000);
+  $('v-next').textContent = seconds > 0
+    ? Math.floor(seconds / 60) + '분 ' + String(seconds % 60).padStart(2, '0') + '초 남음'
+    : '예상 시각 경과 · 새 기록 반영 대기';
+}
+
 /* ================= 수집 루프 ================= */
 async function tick() {
   try {
@@ -389,6 +425,8 @@ function init() {
     return;
   }
   initMap();
+  $('sample-interval').addEventListener('change', updateCountdown);
+  setInterval(updateCountdown, 1000);
   tick();
   setInterval(tick, REFRESH_MS);
   document.addEventListener('visibilitychange', () => {
