@@ -183,6 +183,7 @@
     <dt>GNSS 고도(해발)</dt><dd id="v-alt">—</dd>
     <dt>HDOP</dt><dd id="v-hdop">—</dd>
     <dt>위치 품질</dt><dd id="v-quality">—</dd>
+    <dt>경로 분석</dt><dd id="v-analysis">분석 결과 대기</dd>
     <dt>마지막 신뢰 위치</dt><dd id="v-good">—</dd>
     <dt>착지 추정</dt><dd id="v-landing">판정 대기</dd>
     <dt>GPS 픽스</dt><dd id="v-fix">—</dd>
@@ -216,6 +217,7 @@
 /* ================= 설정 ================= */
 const SHEET_ID = '1jGLhrk-al6uR-K0YCaneLVlI1hITJAdrR1Hyw-OkTTk';   // Google 시트 ID로 교체 (docs/WEB-PAGE.md 참고)
 const REFRESH_MS = 60 * 1000;                  // 자동 새로고침 주기
+const ANALYSIS_DEVICE_ID = 'rpi-hab-01'; // config.toml의 device_id와 일치해야 함
 const STALE_MS   = 3 * 60 * 1000;              // 이 나이보다 오래된 최신 행이면 "데이터 지연"
 const REVERSE_GEOCODE_URL = 'https://photon.komoot.io/reverse';
 
@@ -225,7 +227,8 @@ const GVIZ_QUERY = 'select * order by A desc limit 500';  // A열(seq) 내림차
    M=sats, N=hdop, O=fix */
 const COLS = ['seq','ts_utc','modem_time','reg_status','rsrp_dbm','rsrq_db',
               'rssi_dbm','lat','lon','alt_m','speed_kmh','course_deg','sats',
-              'hdop','fix','position_quality'];
+              'hdop','fix','position_quality','device_id','lat_corrected','lon_corrected',
+              'correction','analyzed_at','analysis_version'];
 
 /* ================= 상태 ================= */
 let map = null;
@@ -482,6 +485,18 @@ function landingAssessment(records) {
 }
 function landingEstimate(records) { return landingAssessment(records).estimate; }
 
+function analyzedPositions(records) {
+  return records.map(r=>{
+    if (r.device_id !== ANALYSIS_DEVICE_ID || r.analysis_version !== 'isolated_spike_v1' ||
+        !['unchanged','interpolated_spike'].includes(r.correction) ||
+        !Number.isFinite(parseTs(r.analyzed_at)) || parseTs(r.analyzed_at)>Date.now()+60000 ||
+        !Number.isFinite(parseTs(r.ts_utc)) ||
+        num(r.lat_corrected) === null || num(r.lon_corrected) === null ||
+        Math.abs(r.lat_corrected)>90 || Math.abs(r.lon_corrected)>180) return null;
+    return {...r,lat:r.lat_corrected,lon:r.lon_corrected};
+  });
+}
+
 function updateView(records) {
   const latest = records[0];  // seq 내림차순 첫 행 = 최신
 
@@ -518,16 +533,29 @@ function updateView(records) {
   $('v-fix').textContent  = fmtFix(latest.fix);
   $('v-reg').textContent  = fmtReg(latest.reg_status);
 
-  /* 지도: fix>0 행만 */
-  const fixed = records.filter(r => [2,3].includes(num(r.fix)) && num(r.lat) !== null && num(r.lon) !== null
-    && Math.abs(r.lat)<=90 && Math.abs(r.lon)<=180);
+  /* Map uses matching analyzed observations only; never fall back to raw spikes. */
+  const analyzed = analyzedPositions(records);
+  const fixed = analyzed.filter(Boolean);
+  $('v-analysis').textContent = fixed.length
+    ? '분석 위치 표시 · 최신 관측은 다음 관측 후 반영 · 분석 '+fmtKst(fixed[0].analyzed_at)
+    : '분석 결과 없음/불일치 · 위치 표시 보류';
 
   if (trackLine)    { trackLine.remove();    trackLine = null; }
   if (latestMarker) { latestMarker.remove(); latestMarker = null; }
 
   if (fixed.length > 0) {
-    const asc = fixed.slice().reverse();           // 시간 오름차순 궤적
-    const latlngs = asc.map(r => [r.lat, r.lon]);
+    const latlngs = [];
+    let segment = [];
+    let previous = null;
+    for (const r of analyzed.slice().reverse()) {
+      if (!r || (previous && (parseTs(r.ts_utc)-parseTs(previous.ts_utc)>600000 ||
+          parseTs(r.ts_utc)<=parseTs(previous.ts_utc)))) {
+        if (segment.length) latlngs.push(segment);
+        segment = []; previous = null;
+      }
+      if (r) { segment.push([r.lat,r.lon]); previous=r; }
+    }
+    if (segment.length) latlngs.push(segment);
     const pos = [fixed[0].lat, fixed[0].lon];      // 최신 fix>0 위치
     latestPosition = pos;
     updateAddress(pos);
@@ -543,7 +571,8 @@ function updateView(records) {
       className: 'latest-marker'
     }).addTo(map);
     latestMarker.bindTooltip(
-      (fixed[0].position_quality === 'stable' ? '안정성 확인' : '안정성 미확인') +
+      (fixed[0].correction === 'interpolated_spike' ? '분석 보간 위치 (추정)' : '분석 위치 · 원본 유지') +
+      ' · '+fmtKst(fixed[0].ts_utc) +
       ' · 해발 고도 ' + fmtAltitude(fixed[0]) +
       ' · 속도 ' + fmt(fixed[0].speed_kmh, 'km/h', 1) +
       ' · HDOP ' + fmt(fixed[0].hdop, '', 1),
@@ -551,7 +580,7 @@ function updateView(records) {
     );
 
     $('v-pos').textContent =
-      '최근 측정 위치 '+(fixed[0].position_quality === 'stable' ? '' : '(안정성 미확인) ') +
+      '최근 분석 위치 '+(fixed[0].correction === 'interpolated_spike' ? '(보간 추정) ' : '') +
       pos[0].toFixed(5) + ', ' + pos[1].toFixed(5) +
       ' (' + ageText(Date.now() - parseTs(fixed[0].ts_utc)) + ' 픽스)';
 
@@ -562,14 +591,14 @@ function updateView(records) {
   } else {
     latestPosition = null;
     updateAddress(null);
-    $('v-pos').textContent = '아직 유효한 GPS 픽스가 없습니다';
+    $('v-pos').textContent = '표시 가능한 분석 위치가 없습니다';
   }
 
   /* 지연 배지: 최신 행 시각이 3분 초과 경과 시 표시 */
-  const age = Date.now() - parseTs(latest.ts_utc);
+  const age = Date.now() - parseTs(fixed.length ? fixed[0].ts_utc : latest.ts_utc);
   const stale = isFinite(age) && age > Math.max(STALE_MS, Number($('sample-interval').value)*1000 + 180000);
   $('stale-badge').hidden = !stale;
-  if (stale) $('stale-badge').textContent = '데이터 지연 · ' + ageText(age) + ' 수신';
+  if (stale) $('stale-badge').textContent = '표시 위치/데이터 지연 · ' + ageText(age);
 
   hasData = true;
   hideOverlay();
