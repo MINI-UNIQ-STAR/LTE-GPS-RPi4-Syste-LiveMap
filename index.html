@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<title>LTE-GPS 라이브맵</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<style>
+  :root {
+    --ink: #0f172a;
+    --muted: #64748b;
+    --line: #e2e8f0;
+    --panel: #ffffff;
+    --accent: #2563eb;
+    --stale-bg: #fef3c7;
+    --stale-ink: #92400e;
+    --stale-line: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic",
+                 "Apple SD Gothic Neo", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--ink);
+    background: #f1f5f9;
+  }
+  #map { position: fixed; inset: 0; }
+
+  /* ---- floating telemetry panel ---- */
+  #panel {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 1100;
+    width: 302px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, .14);
+    padding: 14px 16px 12px;
+  }
+  #panel h1 {
+    margin: 0 0 2px;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  #panel .sub {
+    margin: 0 0 10px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  #panel dl {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px 12px;
+    margin: 0;
+    font-size: 13px;
+  }
+  #panel dt { color: var(--muted); white-space: nowrap; }
+  #panel dd {
+    margin: 0;
+    text-align: right;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    overflow-wrap: anywhere;
+  }
+  #panel .pos {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--line);
+    font-size: 11px;
+    color: var(--muted);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---- staleness badge ---- */
+  #stale-badge {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1150;
+    background: var(--stale-bg);
+    color: var(--stale-ink);
+    border: 1px solid var(--stale-line);
+    border-radius: 999px;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, .12);
+    white-space: nowrap;
+  }
+
+  /* ---- placeholder / error overlay ---- */
+  #overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 1200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(241, 245, 249, .93);
+    padding: 20px;
+  }
+  #overlay .card {
+    max-width: 420px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, .12);
+    padding: 22px 24px;
+    text-align: center;
+  }
+  #overlay h2 { margin: 0 0 8px; font-size: 16px; }
+  #overlay p { margin: 0; font-size: 13px; line-height: 1.65; color: var(--muted); }
+  #overlay code {
+    background: #f1f5f9;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 12px;
+  }
+
+  [hidden] { display: none !important; }
+
+  /* ---- mobile: bottom sheet ---- */
+  @media (max-width: 640px) {
+    #panel {
+      top: auto;
+      right: 10px;
+      left: 10px;
+      bottom: calc(10px + env(safe-area-inset-bottom));
+      width: auto;
+      max-height: 46vh;
+      overflow-y: auto;
+    }
+    #stale-badge { top: calc(10px + env(safe-area-inset-top)); }
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<aside id="panel" aria-label="최신 텔레메트리">
+  <h1>LTE-GPS 라이브맵</h1>
+  <p class="sub">60초마다 자동 갱신 · 최대 ~2분 지연 가능</p>
+  <dl>
+    <dt>수신 시각(UTC)</dt><dd id="v-ts">—</dd>
+    <dt>RSRP</dt><dd id="v-rsrp">—</dd>
+    <dt>RSRQ</dt><dd id="v-rsrq">—</dd>
+    <dt>RSSI</dt><dd id="v-rssi">—</dd>
+    <dt>위성 수</dt><dd id="v-sats">—</dd>
+    <dt>GPS 픽스</dt><dd id="v-fix">—</dd>
+    <dt>등록 상태</dt><dd id="v-reg">—</dd>
+  </dl>
+  <div class="pos" id="v-pos">위치 없음</div>
+</aside>
+
+<div id="stale-badge" hidden role="status">데이터 지연</div>
+
+<div id="overlay" hidden>
+  <div class="card">
+    <h2 id="ov-title"></h2>
+    <p id="ov-body"></p>
+  </div>
+</div>
+
+<noscript>
+  <div style="position:absolute;inset:0;z-index:1300;background:#fff;display:flex;align-items:center;justify-content:center;">
+    이 페이지는 JavaScript가 필요합니다.
+  </div>
+</noscript>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+'use strict';
+
+/* ================= 설정 ================= */
+const SHEET_ID = '1jGLhrk-al6uR-K0YCaneLVlI1hITJAdrR1Hyw-OkTTk';   // Google 시트 ID로 교체 (docs/WEB-PAGE.md 참고)
+const REFRESH_MS = 60 * 1000;                  // 자동 새로고침 주기
+const STALE_MS   = 3 * 60 * 1000;              // 이 나이보다 오래된 최신 행이면 "데이터 지연"
+
+const GVIZ_QUERY = 'select * order by A desc limit 500';  // A열(seq) 내림차순 = 최신 행이 첫 행
+/* 시트 열 순서(고정): A=seq, B=ts_utc, C=modem_time, D=reg_status, E=rsrp_dbm,
+   F=rsrq_db, G=rssi_dbm, H=lat, I=lon, J=alt_m, K=speed_kmh, L=course_deg,
+   M=sats, N=hdop, O=fix */
+const COLS = ['seq','ts_utc','modem_time','reg_status','rsrp_dbm','rsrq_db',
+              'rssi_dbm','lat','lon','alt_m','speed_kmh','course_deg','sats',
+              'hdop','fix'];
+
+/* ================= 상태 ================= */
+let map = null;
+let trackLine = null;
+let latestMarker = null;
+let fitted = false;
+let hasData = false;
+
+/* ================= 유틸 ================= */
+function $(id) { return document.getElementById(id); }
+
+function gvizUrl() {
+  return 'https://docs.google.com/spreadsheets/d/' + SHEET_ID +
+         '/gviz/tq?tqx=out:json&tq=' + encodeURIComponent(GVIZ_QUERY);
+}
+
+/* gviz 응답은 /*O_o*\/ google.visualization.Query.setResponse({...}); 래퍼로
+   감싸여 있으므로 정규식으로 벗겨낸 뒤 JSON.parse 한다. */
+function parseGviz(text) {
+  const m = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]+)\)\s*;?\s*$/);
+  if (!m) throw new Error('gviz 응답 형식이 아닙니다');
+  const obj = JSON.parse(m[1]);
+  if (obj.status !== 'ok') {
+    const errs = (obj.errors || []).map(e => e.detailed_message || e.message || '').join('; ');
+    throw new Error('gviz 오류: ' + (errs || obj.status));
+  }
+  return obj.table && Array.isArray(obj.table.rows) ? obj.table.rows : [];
+}
+
+function toRecord(row) {
+  const rec = {};
+  const cells = row.c || [];
+  for (let i = 0; i < COLS.length; i++) {
+    const cell = cells[i];
+    rec[COLS[i]] = (cell && cell.v !== undefined && cell.v !== null) ? cell.v : null;
+  }
+  return rec;
+}
+
+function num(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+function fmt(v, unit, digits) {
+  const n = num(v);
+  if (n === null) return '—';
+  return (digits === undefined ? String(n) : n.toFixed(digits)) + (unit ? ' ' + unit : '');
+}
+function fmtFix(v) {
+  const n = num(v);
+  if (n === null || n === 0) return '없음';
+  if (n === 2) return '2D';
+  if (n === 3) return '3D';
+  return String(n);
+}
+function fmtReg(s) {
+  if (!s) return '—';
+  const table = {
+    home: '홈 네트워크', roaming: '로밍', searching: '탐색 중',
+    denied: '등록 거부', unknown: '알 수 없음', not_registered: '미등록'
+  };
+  return table[String(s).toLowerCase()] || String(s);
+}
+function ageText(ms) {
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return '방금 전';
+  if (min < 60) return min + '분 전';
+  return Math.floor(min / 60) + '시간 ' + (min % 60) + '분 전';
+}
+
+/* ================= 오버레이 ================= */
+const OVERLAYS = {
+  config: ['SHEET_ID 설정 필요',
+    '이 파일 상단의 <code>SHEET_ID</code> 상수를 Google 시트 ID로 교체해야 합니다.<br>' +
+    '절차는 <code>docs/WEB-PAGE.md</code>를 참고하세요.'],
+  empty: ['아직 데이터가 없습니다',
+    '로거가 시트에 첫 행을 기록하면 자동으로 표시됩니다.<br>(시트 반영까지 최대 ~2분 지연 가능)'],
+  error: ['데이터를 불러오지 못했습니다',
+    '시트 공유 설정("링크가 있는 모든 사용자" 뷰어)과 "웹에 게시" 여부를 확인하세요.<br>' +
+    '60초 후 자동으로 다시 시도합니다.']
+};
+function showOverlay(kind) {
+  $('ov-title').textContent = OVERLAYS[kind][0];
+  $('ov-body').innerHTML = OVERLAYS[kind][1];
+  $('overlay').hidden = false;
+}
+function hideOverlay() { $('overlay').hidden = true; }
+
+/* ================= 지도 ================= */
+function initMap() {
+  map = L.map('map', { worldCopyJump: true });
+  map.attributionControl.setPosition('bottomleft');
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  map.setView([37.5665, 126.9780], 12);  // 데이터 도착 전 임시 뷰 (서울)
+}
+
+function markerRadius(hdop) {
+  const h = num(hdop);
+  return Math.min(18, Math.max(6, 5 + (h === null ? 1 : h) * 1.5));
+}
+
+function updateView(records) {
+  const latest = records[0];  // seq 내림차순 첫 행 = 최신
+
+  /* 패널: 최신 행의 신호 값 — fix=0 행이어도 그대로 표시 */
+  $('v-ts').textContent   = latest.ts_utc ? String(latest.ts_utc) : '—';
+  $('v-rsrp').textContent = fmt(latest.rsrp_dbm, 'dBm');
+  $('v-rsrq').textContent = fmt(latest.rsrq_db, 'dB', 1);
+  $('v-rssi').textContent = fmt(latest.rssi_dbm, 'dBm');
+  $('v-sats').textContent = fmt(latest.sats);
+  $('v-fix').textContent  = fmtFix(latest.fix);
+  $('v-reg').textContent  = fmtReg(latest.reg_status);
+
+  /* 지도: fix>0 행만 */
+  const fixed = records.filter(r => num(r.fix) > 0 && num(r.lat) !== null && num(r.lon) !== null);
+
+  if (trackLine)    { trackLine.remove();    trackLine = null; }
+  if (latestMarker) { latestMarker.remove(); latestMarker = null; }
+
+  if (fixed.length > 0) {
+    const asc = fixed.slice().reverse();           // 시간 오름차순 궤적
+    const latlngs = asc.map(r => [r.lat, r.lon]);
+    const pos = [fixed[0].lat, fixed[0].lon];      // 최신 fix>0 위치
+
+    trackLine = L.polyline(latlngs, {
+      color: '#2563eb', weight: 3, opacity: 0.85, className: 'track-line'
+    }).addTo(map);
+
+    latestMarker = L.circleMarker(pos, {
+      radius: markerRadius(fixed[0].hdop),
+      color: '#b91c1c', weight: 2,
+      fillColor: '#ef4444', fillOpacity: 0.85,
+      className: 'latest-marker'
+    }).addTo(map);
+    latestMarker.bindTooltip(
+      '고도 ' + fmt(fixed[0].alt_m, 'm', 0) +
+      ' · 속도 ' + fmt(fixed[0].speed_kmh, 'km/h', 1) +
+      ' · HDOP ' + fmt(fixed[0].hdop, '', 1),
+      { direction: 'top', offset: [0, -8] }
+    );
+
+    $('v-pos').textContent =
+      '최신 위치 ' + pos[0].toFixed(5) + ', ' + pos[1].toFixed(5) +
+      ' (' + ageText(Date.now() - parseTs(fixed[0].ts_utc)) + ' 픽스)';
+
+    if (!fitted) {
+      map.fitBounds(trackLine.getBounds().pad(0.25));
+      fitted = true;
+    }
+  } else {
+    $('v-pos').textContent = '아직 유효한 GPS 픽스가 없습니다';
+  }
+
+  /* 지연 배지: 최신 행 시각이 3분 초과 경과 시 표시 */
+  const age = Date.now() - parseTs(latest.ts_utc);
+  const stale = isFinite(age) && age > STALE_MS;
+  $('stale-badge').hidden = !stale;
+  if (stale) $('stale-badge').textContent = '데이터 지연 · ' + ageText(age) + ' 수신';
+
+  hasData = true;
+  hideOverlay();
+}
+
+function parseTs(s) {
+  const t = Date.parse(s);
+  return isNaN(t) ? NaN : t;
+}
+
+/* ================= 수집 루프 ================= */
+async function tick() {
+  try {
+    const res = await fetch(gvizUrl(), { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const rows = parseGviz(await res.text());
+    if (rows.length === 0) {
+      if (!hasData) showOverlay('empty');
+      return;
+    }
+    updateView(rows.map(toRecord));
+  } catch (err) {
+    console.warn('[livemap] 갱신 실패:', err);
+    if (!hasData) showOverlay('error');
+  }
+}
+
+function init() {
+  if (!SHEET_ID || SHEET_ID === 'PASTE_YOUR_SHEET_ID_HERE') {
+    showOverlay('config');
+    return;
+  }
+  if (typeof L === 'undefined') {
+    $('ov-title').textContent = '지도 라이브러리를 불러오지 못했습니다';
+    $('ov-body').textContent = '네트워크 연결을 확인한 뒤 새로고침하세요. (Leaflet CDN 접근 실패)';
+    $('overlay').hidden = false;
+    return;
+  }
+  initMap();
+  tick();
+  setInterval(tick, REFRESH_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') tick();
+  });
+}
+
+init();
+</script>
+</body>
+</html>
