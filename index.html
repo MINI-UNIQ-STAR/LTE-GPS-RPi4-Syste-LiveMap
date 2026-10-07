@@ -7,6 +7,10 @@
 <title>LTE-GPS 라이브맵</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.3.0/dist/maplibre-gl.css">
+<script type="importmap">
+{"imports":{"leaflet":"https://unpkg.com/leaflet@1.9.4/dist/leaflet-src.esm.js","maplibre-gl":"https://unpkg.com/maplibre-gl@6.3.0/dist/maplibre-gl.mjs"}}
+</script>
 <style>
   :root {
     --ink: #0f172a;
@@ -34,7 +38,9 @@
     top: 12px;
     right: 12px;
     z-index: 1100;
-    width: 302px;
+    width: 350px;
+    max-height: calc(100vh - 28px);
+    overflow-y: auto;
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 12px;
@@ -76,6 +82,10 @@
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
+  .map-tools { display:flex; gap:8px; margin:10px 0; align-items:center; }
+  select, button { font:inherit; border:1px solid var(--line); border-radius:6px; padding:5px 7px; background:white; }
+  button { cursor:pointer; }
+  #v-address { text-align:left; line-height:1.5; }
 
   /* ---- staleness badge ---- */
   #stale-badge {
@@ -148,8 +158,18 @@
 <aside id="panel" aria-label="최신 텔레메트리">
   <h1>LTE-GPS 라이브맵</h1>
   <p class="sub">60초마다 자동 갱신 · 최대 ~2분 지연 가능</p>
+  <div class="map-tools">
+    <select id="map-style" aria-label="지도 종류">
+      <option value="vector">일반지도 · 벡터</option>
+      <option value="satellite">위성지도 · Esri</option>
+      <option value="osm">일반지도 · OSM</option>
+    </select>
+    <button id="center-location" type="button">최신 위치로</button>
+  </div>
+  <p class="sub" id="map-status">벡터지도 준비 중</p>
   <dl>
-    <dt>수신 시각(UTC)</dt><dd id="v-ts">—</dd>
+    <dt>수신 시각(한국시간)</dt><dd id="v-ts">—</dd>
+    <dt>최신 위치 부근 주소</dt><dd id="v-address" aria-live="polite">위치 수신 대기</dd>
     <dt>기록 주기</dt><dd><select id="sample-interval" aria-label="예상 기록 주기">
       <option value="60">60초</option>
       <option value="120">120초</option>
@@ -162,11 +182,15 @@
     <dt>위성 수</dt><dd id="v-sats">—</dd>
     <dt>GNSS 고도(해발)</dt><dd id="v-alt">—</dd>
     <dt>HDOP</dt><dd id="v-hdop">—</dd>
+    <dt>위치 품질</dt><dd id="v-quality">—</dd>
+    <dt>마지막 양호 위치</dt><dd id="v-good">—</dd>
+    <dt>착지 추정</dt><dd id="v-landing">판정 대기</dd>
     <dt>GPS 픽스</dt><dd id="v-fix">—</dd>
     <dt>등록 상태</dt><dd id="v-reg">—</dd>
   </dl>
   <p class="sub">남은 시간은 최신 기록 기준 예상치입니다. GNSS 수신·업로드에 따라 달라집니다. 주기 선택은 로거 설정을 변경하지 않습니다.</p>
   <div class="pos" id="v-pos">위치 없음</div>
+  <p class="sub">주소·지명: <a href="https://photon.komoot.io" target="_blank" rel="noopener">Photon</a> / <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap</a> · 좌표 인근의 참고 주소</p>
 </aside>
 
 <div id="stale-badge" hidden role="status">데이터 지연</div>
@@ -193,6 +217,7 @@
 const SHEET_ID = '1jGLhrk-al6uR-K0YCaneLVlI1hITJAdrR1Hyw-OkTTk';   // Google 시트 ID로 교체 (docs/WEB-PAGE.md 참고)
 const REFRESH_MS = 60 * 1000;                  // 자동 새로고침 주기
 const STALE_MS   = 3 * 60 * 1000;              // 이 나이보다 오래된 최신 행이면 "데이터 지연"
+const REVERSE_GEOCODE_URL = 'https://photon.komoot.io/reverse';
 
 const GVIZ_QUERY = 'select * order by A desc limit 500';  // A열(seq) 내림차순 = 최신 행이 첫 행
 /* 시트 열 순서(고정): A=seq, B=ts_utc, C=modem_time, D=reg_status, E=rsrp_dbm,
@@ -206,12 +231,31 @@ const COLS = ['seq','ts_utc','modem_time','reg_status','rsrp_dbm','rsrq_db',
 let map = null;
 let trackLine = null;
 let latestMarker = null;
+let goodMarker = null;
+let landingMarker = null;
 let fitted = false;
 let hasData = false;
 let latestSampleMs = NaN;
+let latestPosition = null;
+let baseLayers = {};
+let activeBase = null;
+let addressKey = null;
+let addressRequest = null;
+let addressTimer = null;
+let lastAddressRequestMs = -Infinity;
+const addressCache = new Map();
 
 /* ================= 유틸 ================= */
 function $(id) { return document.getElementById(id); }
+
+const kstFormatter = new Intl.DateTimeFormat('ko-KR', {
+  timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+});
+function fmtKst(value) {
+  const timestamp = value ? parseTs(value) : NaN;
+  return Number.isFinite(timestamp) ? kstFormatter.format(new Date(timestamp)) + ' KST' : '—';
+}
 
 function gvizUrl() {
   return 'https://docs.google.com/spreadsheets/d/' + SHEET_ID +
@@ -289,13 +333,109 @@ function hideOverlay() { $('overlay').hidden = true; }
 
 /* ================= 지도 ================= */
 function initMap() {
-  map = L.map('map', { worldCopyJump: true });
+  map = L.map('map', { worldCopyJump: true, minZoom:1, maxZoom:20,
+    maxBounds:[[-85,-Infinity],[85,Infinity]], maxBoundsViscosity:1 });
   map.attributionControl.setPosition('bottomleft');
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
+  baseLayers.osm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxNativeZoom:19, maxZoom:20,
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-  }).addTo(map);
+  });
+  baseLayers.satellite = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxNativeZoom:19, maxZoom:20,
+    attribution:'Tiles © Esri — Sources: Esri, Maxar, Earthstar Geographics, and the GIS User Community'
+  });
+  activeBase = baseLayers.osm.addTo(map);
+  $('map-style').addEventListener('change', switchBasemap);
+  $('center-location').addEventListener('click', () => {
+    if (latestPosition) map.setView(latestPosition, Math.max(16,map.getZoom()));
+  });
+  prepareVectorMap();
   map.setView([37.5665, 126.9780], 12);  // 데이터 도착 전 임시 뷰 (서울)
+}
+
+function switchBasemap() {
+  const chosen = $('map-style').value;
+  const layer = baseLayers[chosen] || baseLayers.osm;
+  if (activeBase !== layer) {
+    if (activeBase) map.removeLayer(activeBase);
+    activeBase = null;
+    try { activeBase = layer.addTo(map); }
+    catch (error) {
+      $('map-style').value = 'osm';
+      activeBase = baseLayers.osm.addTo(map);
+      $('map-status').textContent = '지도 표시 실패 · OSM으로 전환';
+      return;
+    }
+  }
+  $('map-status').textContent = chosen === 'satellite' ? '위성영상 촬영 시점은 지역마다 다릅니다'
+    : chosen === 'vector' && !baseLayers.vector ? '벡터지도 준비/연결 실패 시 OSM 표시'
+    : chosen === 'vector' ? 'OpenFreeMap 벡터지도' : 'OpenStreetMap 일반지도';
+}
+async function prepareVectorMap() {
+  try {
+    const [gl, adapter] = await Promise.all([
+      import('maplibre-gl'), import('https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.1.4/dist/leaflet-maplibre-gl.mjs')
+    ]);
+    gl.setWorkerUrl('https://unpkg.com/maplibre-gl@6.3.0/dist/maplibre-gl-worker.mjs');
+    baseLayers.vector = adapter.maplibreGL({style:'https://tiles.openfreemap.org/styles/liberty',
+      attribution:'<a href="https://openfreemap.org">OpenFreeMap</a> · © OpenMapTiles · <a href="https://www.openstreetmap.org/copyright">© OpenStreetMap</a>'});
+    baseLayers.vector.on('add', () => {
+      baseLayers.vector.getMaplibreMap().on('error', () => {
+        if ($('map-style').value === 'vector') {
+          $('map-style').value = 'osm';
+          switchBasemap();
+          $('map-status').textContent = '벡터지도 연결 실패 · OSM으로 전환';
+        }
+      });
+    });
+    switchBasemap();
+  } catch (error) {
+    console.warn('[livemap] vector basemap:', error);
+    delete baseLayers.vector;
+    if ($('map-style').value === 'vector') $('map-style').value = 'osm';
+    switchBasemap();
+  }
+}
+
+function formatAddress(feature) {
+  const p = feature && feature.properties;
+  if (!p) return '주변 주소·지명 없음';
+  return [...new Set([p.country,p.state,p.county,p.city,p.district,p.locality,
+    p.street,p.housenumber,p.name].filter(v=>typeof v==='string' && v.trim()))].join(' ') || '주변 주소·지명 없음';
+}
+function updateAddress(pos) {
+  const key = pos ? pos.map(n=>n.toFixed(5)).join(',') : null;
+  if (key === addressKey) return;
+  addressKey = key;
+  if (addressRequest) addressRequest.abort();
+  if (addressTimer) clearTimeout(addressTimer);
+  if (!pos) { $('v-address').textContent = '위치 수신 대기'; return; }
+  if (addressCache.has(key)) { $('v-address').textContent = addressCache.get(key); return; }
+  $('v-address').textContent = '주변 주소·지명 조회 중…';
+  const delay = Math.max(0, 60000 - (Date.now()-lastAddressRequestMs));
+  addressTimer = setTimeout(async () => {
+    if (addressKey !== key) return;
+    const controller = new AbortController();
+    addressRequest = controller;
+    lastAddressRequestMs = Date.now();
+    const timeout = setTimeout(()=>controller.abort(),10000);
+    try {
+      const url = new URL(REVERSE_GEOCODE_URL);
+      url.search = new URLSearchParams({lat:pos[0],lon:pos[1],limit:1,radius:1}).toString();
+      const response = await fetch(url, {signal:controller.signal});
+      if (!response.ok) throw new Error('HTTP '+response.status);
+      const data = await response.json();
+      const text = formatAddress(data.features && data.features[0]);
+      addressCache.set(key,text);
+      if (addressCache.size>100) addressCache.delete(addressCache.keys().next().value);
+      if (addressKey === key) $('v-address').textContent = text;
+    } catch (error) {
+      if (addressKey === key) {
+        $('v-address').textContent = '주소 조회 실패 · 좌표로 확인';
+        addressKey = null; // Retry at the next data refresh, respecting the rate limit.
+      }
+    } finally { clearTimeout(timeout); if (addressRequest===controller) addressRequest=null; }
+  },delay);
 }
 
 function markerRadius(hdop) {
@@ -308,11 +448,36 @@ function fmtAltitude(record) {
   return num(record.fix) === 3 ? fmt(record.alt_m, 'm', 1) : '—';
 }
 
+// A small HDOP describes geometry, not guaranteed accuracy. No altitude gate.
+function usablePosition(r) {
+  return [2, 3].includes(num(r.fix)) && num(r.lat) !== null && num(r.lon) !== null &&
+    Math.abs(r.lat) <= 90 && Math.abs(r.lon) <= 180 && num(r.hdop) > 0 && num(r.hdop) <= 5;
+}
+function metersBetween(a, b) {
+  const rad = Math.PI / 180;
+  const h = Math.sin((b[0]-a[0])*rad/2)**2 + Math.cos(a[0]*rad)*Math.cos(b[0]*rad)*Math.sin((b[1]-a[1])*rad/2)**2;
+  return 6371000 * 2 * Math.asin(Math.sqrt(Math.min(1, Math.max(0, h))));
+}
+function landingEstimate(records) {
+  const points = records.slice(0, 6);
+  if (points.length < 6 || points.some(r => !usablePosition(r) || !Number.isFinite(parseTs(r.ts_utc)))) return null;
+  const gapLimit = Math.max(600, Number($('sample-interval').value)*2)*1000;
+  for (let i=1; i<points.length; i++) {
+    const gap = parseTs(points[i-1].ts_utc)-parseTs(points[i].ts_utc);
+    if (gap <= 0 || gap > gapLimit) return null;
+  }
+  if (parseTs(points[0].ts_utc)-parseTs(points[5].ts_utc) < 900000) return null;
+  const mid = values => { const a=values.slice().sort((a,b)=>a-b); return (a[2]+a[3])/2; };
+  const center = [mid(points.map(r=>r.lat)), mid(points.map(r=>r.lon))];
+  const spread = Math.max(...points.map(r=>metersBetween(center, [r.lat,r.lon])));
+  return spread <= 50 ? {center, spread, ts: points[0].ts_utc} : null;
+}
+
 function updateView(records) {
   const latest = records[0];  // seq 내림차순 첫 행 = 최신
 
   /* 패널: 최신 행의 신호 값 — fix=0 행이어도 그대로 표시 */
-  $('v-ts').textContent   = latest.ts_utc ? String(latest.ts_utc) : '—';
+  $('v-ts').textContent   = fmtKst(latest.ts_utc);
   latestSampleMs = latest.ts_utc ? parseTs(latest.ts_utc) : NaN;
   updateCountdown();
   $('v-rsrp').textContent = fmt(latest.rsrp_dbm, 'dBm');
@@ -321,11 +486,29 @@ function updateView(records) {
   $('v-sats').textContent = fmt(latest.sats);
   $('v-alt').textContent  = fmtAltitude(latest);
   $('v-hdop').textContent = fmt(latest.hdop, '', 1);
+  $('v-quality').textContent = usablePosition(latest) ? 'HDOP 기준 양호 · 정확도 보장 아님'
+    : [2,3].includes(num(latest.fix)) ? '품질 불확실' : '위치 미확정';
+  if (goodMarker) { goodMarker.remove(); goodMarker = null; }
+  if (landingMarker) { landingMarker.remove(); landingMarker = null; }
+  const good = records.find(usablePosition);
+  $('v-good').textContent = good ? good.lat.toFixed(5)+', '+good.lon.toFixed(5)+' · '+fmtKst(good.ts_utc) : '없음';
+  if (good && good !== latest) {
+    goodMarker = L.circleMarker([good.lat,good.lon], {radius:7,color:'#1d4ed8',fillOpacity:0.6}).addTo(map);
+    goodMarker.bindTooltip('마지막 HDOP 기준 양호 위치 · '+fmtKst(good.ts_utc));
+  }
+  const landing = landingEstimate(records);
+  $('v-landing').textContent = landing ? '정지 추정 · 분포 반경 '+landing.spread.toFixed(0)+'m · '+fmtKst(landing.ts)
+    : '미확정 · 6회/15분 이상 관측 필요';
+  if (landing) {
+    landingMarker = L.circle(landing.center, {radius:Math.max(5,landing.spread),color:'#15803d',fillOpacity:0.15}).addTo(map);
+    landingMarker.bindTooltip('착지 후보 · 비행 중 정체와 구분 불가');
+  }
   $('v-fix').textContent  = fmtFix(latest.fix);
   $('v-reg').textContent  = fmtReg(latest.reg_status);
 
   /* 지도: fix>0 행만 */
-  const fixed = records.filter(r => num(r.fix) > 0 && num(r.lat) !== null && num(r.lon) !== null);
+  const fixed = records.filter(r => [2,3].includes(num(r.fix)) && num(r.lat) !== null && num(r.lon) !== null
+    && Math.abs(r.lat)<=90 && Math.abs(r.lon)<=180);
 
   if (trackLine)    { trackLine.remove();    trackLine = null; }
   if (latestMarker) { latestMarker.remove(); latestMarker = null; }
@@ -334,6 +517,8 @@ function updateView(records) {
     const asc = fixed.slice().reverse();           // 시간 오름차순 궤적
     const latlngs = asc.map(r => [r.lat, r.lon]);
     const pos = [fixed[0].lat, fixed[0].lon];      // 최신 fix>0 위치
+    latestPosition = pos;
+    updateAddress(pos);
 
     trackLine = L.polyline(latlngs, {
       color: '#2563eb', weight: 3, opacity: 0.85, className: 'track-line'
@@ -361,12 +546,14 @@ function updateView(records) {
       fitted = true;
     }
   } else {
+    latestPosition = null;
+    updateAddress(null);
     $('v-pos').textContent = '아직 유효한 GPS 픽스가 없습니다';
   }
 
   /* 지연 배지: 최신 행 시각이 3분 초과 경과 시 표시 */
   const age = Date.now() - parseTs(latest.ts_utc);
-  const stale = isFinite(age) && age > STALE_MS;
+  const stale = isFinite(age) && age > Math.max(STALE_MS, Number($('sample-interval').value)*1000 + 180000);
   $('stale-badge').hidden = !stale;
   if (stale) $('stale-badge').textContent = '데이터 지연 · ' + ageText(age) + ' 수신';
 
