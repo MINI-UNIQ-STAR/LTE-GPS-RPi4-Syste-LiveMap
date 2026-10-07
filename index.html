@@ -183,7 +183,7 @@
     <dt>GNSS 고도(해발)</dt><dd id="v-alt">—</dd>
     <dt>HDOP</dt><dd id="v-hdop">—</dd>
     <dt>위치 품질</dt><dd id="v-quality">—</dd>
-    <dt>마지막 양호 위치</dt><dd id="v-good">—</dd>
+    <dt>마지막 신뢰 위치</dt><dd id="v-good">—</dd>
     <dt>착지 추정</dt><dd id="v-landing">판정 대기</dd>
     <dt>GPS 픽스</dt><dd id="v-fix">—</dd>
     <dt>등록 상태</dt><dd id="v-reg">—</dd>
@@ -225,7 +225,7 @@ const GVIZ_QUERY = 'select * order by A desc limit 500';  // A열(seq) 내림차
    M=sats, N=hdop, O=fix */
 const COLS = ['seq','ts_utc','modem_time','reg_status','rsrp_dbm','rsrq_db',
               'rssi_dbm','lat','lon','alt_m','speed_kmh','course_deg','sats',
-              'hdop','fix'];
+              'hdop','fix','position_quality'];
 
 /* ================= 상태 ================= */
 let map = null;
@@ -450,7 +450,8 @@ function fmtAltitude(record) {
 
 // A small HDOP describes geometry, not guaranteed accuracy. No altitude gate.
 function usablePosition(r) {
-  return [2, 3].includes(num(r.fix)) && num(r.lat) !== null && num(r.lon) !== null &&
+  return !['unstable','uncertain','no_fix'].includes(r.position_quality) &&
+    [2, 3].includes(num(r.fix)) && num(r.lat) !== null && num(r.lon) !== null &&
     Math.abs(r.lat) <= 90 && Math.abs(r.lon) <= 180 && num(r.hdop) > 0 && num(r.hdop) <= 5;
 }
 function metersBetween(a, b) {
@@ -458,20 +459,28 @@ function metersBetween(a, b) {
   const h = Math.sin((b[0]-a[0])*rad/2)**2 + Math.cos(a[0]*rad)*Math.cos(b[0]*rad)*Math.sin((b[1]-a[1])*rad/2)**2;
   return 6371000 * 2 * Math.asin(Math.sqrt(Math.min(1, Math.max(0, h))));
 }
-function landingEstimate(records) {
-  const points = records.slice(0, 6);
-  if (points.length < 6 || points.some(r => !usablePosition(r) || !Number.isFinite(parseTs(r.ts_utc)))) return null;
+function landingAssessment(records) {
+  const points = [];
   const gapLimit = Math.max(600, Number($('sample-interval').value)*2)*1000;
-  for (let i=1; i<points.length; i++) {
-    const gap = parseTs(points[i-1].ts_utc)-parseTs(points[i].ts_utc);
-    if (gap <= 0 || gap > gapLimit) return null;
+  for (const r of records) {
+    if (r.position_quality !== 'stable' || !usablePosition(r) || !Number.isFinite(parseTs(r.ts_utc))) break;
+    if (points.length) {
+      const gap = parseTs(points.at(-1).ts_utc)-parseTs(r.ts_utc);
+      if (gap <= 0 || gap > gapLimit) break;
+    }
+    points.push(r);
+    if (points.length >= 6 && parseTs(points[0].ts_utc)-parseTs(r.ts_utc) >= 900000) break;
   }
-  if (parseTs(points[0].ts_utc)-parseTs(points[5].ts_utc) < 900000) return null;
-  const mid = values => { const a=values.slice().sort((a,b)=>a-b); return (a[2]+a[3])/2; };
+  if (points.length < 6) return {estimate:null, reason:'유효 관측 '+points.length+'/6회 · 불안정/누락 시 연속 관측 재시작'};
+  const elapsed = (parseTs(points[0].ts_utc)-parseTs(points.at(-1).ts_utc))/1000;
+  if (elapsed < 900) return {estimate:null, reason:'관측 기간 '+Math.floor(elapsed/60)+'분 '+Math.floor(elapsed%60)+'초 / 15분'};
+  const mid = values => { const a=values.slice().sort((a,b)=>a-b), i=Math.floor(a.length/2); return a.length%2 ? a[i] : (a[i-1]+a[i])/2; };
   const center = [mid(points.map(r=>r.lat)), mid(points.map(r=>r.lon))];
   const spread = Math.max(...points.map(r=>metersBetween(center, [r.lat,r.lon])));
-  return spread <= 50 ? {center, spread, ts: points[0].ts_utc} : null;
+  return spread <= 50 ? {estimate:{center, spread, ts: points[0].ts_utc},reason:''}
+    : {estimate:null,reason:'위치 분산 반경 '+spread.toFixed(0)+'m / 기준 50m'};
 }
+function landingEstimate(records) { return landingAssessment(records).estimate; }
 
 function updateView(records) {
   const latest = records[0];  // seq 내림차순 첫 행 = 최신
@@ -486,19 +495,22 @@ function updateView(records) {
   $('v-sats').textContent = fmt(latest.sats);
   $('v-alt').textContent  = fmtAltitude(latest);
   $('v-hdop').textContent = fmt(latest.hdop, '', 1);
-  $('v-quality').textContent = usablePosition(latest) ? 'HDOP 기준 양호 · 정확도 보장 아님'
+  $('v-quality').textContent = latest.position_quality === 'stable' && usablePosition(latest) ? '짧은 관측 안정성 확인 · 정확도 보장 아님'
+    : latest.position_quality === 'unstable' ? '좌표 불안정 · 신뢰 위치 갱신 보류'
+    : usablePosition(latest) ? '과거 HDOP 기준 양호 · 안정성 확인 정보 없음'
     : [2,3].includes(num(latest.fix)) ? '품질 불확실' : '위치 미확정';
   if (goodMarker) { goodMarker.remove(); goodMarker = null; }
   if (landingMarker) { landingMarker.remove(); landingMarker = null; }
-  const good = records.find(usablePosition);
+  const good = records.find(r=>r.position_quality === 'stable' && usablePosition(r));
   $('v-good').textContent = good ? good.lat.toFixed(5)+', '+good.lon.toFixed(5)+' · '+fmtKst(good.ts_utc) : '없음';
   if (good && good !== latest) {
     goodMarker = L.circleMarker([good.lat,good.lon], {radius:7,color:'#1d4ed8',fillOpacity:0.6}).addTo(map);
-    goodMarker.bindTooltip('마지막 HDOP 기준 양호 위치 · '+fmtKst(good.ts_utc));
+    goodMarker.bindTooltip('마지막 안정성 확인 위치 · '+fmtKst(good.ts_utc));
   }
-  const landing = landingEstimate(records);
+  const assessment = landingAssessment(records);
+  const landing = assessment.estimate;
   $('v-landing').textContent = landing ? '정지 추정 · 분포 반경 '+landing.spread.toFixed(0)+'m · '+fmtKst(landing.ts)
-    : '미확정 · 6회/15분 이상 관측 필요';
+    : '미확정 · '+assessment.reason;
   if (landing) {
     landingMarker = L.circle(landing.center, {radius:Math.max(5,landing.spread),color:'#15803d',fillOpacity:0.15}).addTo(map);
     landingMarker.bindTooltip('착지 후보 · 비행 중 정체와 구분 불가');
@@ -531,14 +543,16 @@ function updateView(records) {
       className: 'latest-marker'
     }).addTo(map);
     latestMarker.bindTooltip(
-      '해발 고도 ' + fmtAltitude(fixed[0]) +
+      (fixed[0].position_quality === 'stable' ? '안정성 확인' : '안정성 미확인') +
+      ' · 해발 고도 ' + fmtAltitude(fixed[0]) +
       ' · 속도 ' + fmt(fixed[0].speed_kmh, 'km/h', 1) +
       ' · HDOP ' + fmt(fixed[0].hdop, '', 1),
       { direction: 'top', offset: [0, -8] }
     );
 
     $('v-pos').textContent =
-      '최신 위치 ' + pos[0].toFixed(5) + ', ' + pos[1].toFixed(5) +
+      '최근 측정 위치 '+(fixed[0].position_quality === 'stable' ? '' : '(안정성 미확인) ') +
+      pos[0].toFixed(5) + ', ' + pos[1].toFixed(5) +
       ' (' + ageText(Date.now() - parseTs(fixed[0].ts_utc)) + ' 픽스)';
 
     if (!fitted) {
