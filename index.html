@@ -157,7 +157,7 @@
 
 <aside id="panel" aria-label="최신 텔레메트리">
   <h1>LTE-GPS 라이브맵</h1>
-  <p class="sub">60초마다 자동 갱신 · 최대 ~2분 지연 가능</p>
+  <p class="sub">15초마다 자동 갱신 · 수신·시트 반영에 따라 지연</p>
   <div class="map-tools">
     <select id="map-style" aria-label="지도 종류">
       <option value="vector">일반지도 · 벡터</option>
@@ -216,7 +216,7 @@
 
 /* ================= 설정 ================= */
 const SHEET_ID = '1jGLhrk-al6uR-K0YCaneLVlI1hITJAdrR1Hyw-OkTTk';   // Google 시트 ID로 교체 (docs/WEB-PAGE.md 참고)
-const REFRESH_MS = 60 * 1000;                  // 자동 새로고침 주기
+const REFRESH_MS = 15 * 1000;                  // 자동 새로고침 주기
 const ANALYSIS_DEVICE_ID = 'rpi-hab-01'; // config.toml의 device_id와 일치해야 함
 const STALE_MS   = 3 * 60 * 1000;              // 이 나이보다 오래된 최신 행이면 "데이터 지연"
 const REVERSE_GEOCODE_URL = 'https://photon.komoot.io/reverse';
@@ -322,10 +322,10 @@ const OVERLAYS = {
     '이 파일 상단의 <code>SHEET_ID</code> 상수를 Google 시트 ID로 교체해야 합니다.<br>' +
     '절차는 <code>docs/WEB-PAGE.md</code>를 참고하세요.'],
   empty: ['아직 데이터가 없습니다',
-    '로거가 시트에 첫 행을 기록하면 자동으로 표시됩니다.<br>(시트 반영까지 최대 ~2분 지연 가능)'],
+    '로거가 시트에 첫 행을 기록하면 자동으로 표시됩니다.<br>(LTE 전송·시트 반영에 따라 지연될 수 있습니다.)'],
   error: ['데이터를 불러오지 못했습니다',
     '시트 공유 설정("링크가 있는 모든 사용자" 뷰어)과 "웹에 게시" 여부를 확인하세요.<br>' +
-    '60초 후 자동으로 다시 시도합니다.']
+    '15초 후 자동으로 다시 시도합니다.']
 };
 function showOverlay(kind) {
   $('ov-title').textContent = OVERLAYS[kind][0];
@@ -487,14 +487,43 @@ function landingEstimate(records) { return landingAssessment(records).estimate; 
 
 function analyzedPositions(records) {
   return records.map(r=>{
-    if (r.device_id !== ANALYSIS_DEVICE_ID || r.analysis_version !== 'isolated_spike_v1' ||
-        !['unchanged','interpolated_spike'].includes(r.correction) ||
+    const methods = {isolated_spike_v1:['unchanged','interpolated_spike'],
+      stationary_median_v2:['unchanged','interpolated_spike','stationary_median']};
+    if (r.device_id !== ANALYSIS_DEVICE_ID ||
+        !Object.prototype.hasOwnProperty.call(methods, r.analysis_version) ||
+        !methods[r.analysis_version].includes(r.correction) ||
         !Number.isFinite(parseTs(r.analyzed_at)) || parseTs(r.analyzed_at)>Date.now()+60000 ||
         !Number.isFinite(parseTs(r.ts_utc)) ||
         num(r.lat_corrected) === null || num(r.lon_corrected) === null ||
         Math.abs(r.lat_corrected)>90 || Math.abs(r.lon_corrected)>180) return null;
     return {...r,lat:r.lat_corrected,lon:r.lon_corrected};
   });
+}
+
+function displayPositions(records) {
+  const positions = analyzedPositions(records);
+  const latest = records[0];
+  const stationaryIndex = positions.findIndex(r=>r && r.correction === 'stationary_median');
+  const stationary = positions[stationaryIndex];
+  // Retain an explicitly dated analyzed position while subsequent low-speed
+  // observations support it. Movement, gaps, or rejected fixes end the hold.
+  const holdStationary = stationaryIndex > 0 &&
+    parseTs(latest.ts_utc)-parseTs(stationary.ts_utc) <= 600000 &&
+    records.slice(0,stationaryIndex).every((r,i)=>
+      !r.correction && !r.analysis_version && usablePosition(r) &&
+      num(r.speed_kmh) !== null && num(r.speed_kmh) >= 0 && num(r.speed_kmh) <= 0.5 &&
+      parseTs(r.ts_utc)>parseTs(records[i+1].ts_utc) &&
+      parseTs(r.ts_utc)-parseTs(records[i+1].ts_utc)<=600000 &&
+      metersBetween([stationary.lat,stationary.lon],[r.lat,r.lon])<=100);
+  // Preview only the newest coherent raw fix. Reviewed rejections and unknown
+  // analysis versions must never be bypassed by falling back to raw coordinates.
+  if (latest && !holdStationary && !positions[0] && !latest.correction && !latest.analysis_version &&
+      latest.device_id === ANALYSIS_DEVICE_ID && latest.position_quality === 'stable' &&
+      usablePosition(latest) && Number.isFinite(parseTs(latest.ts_utc)) &&
+      parseTs(latest.ts_utc) <= Date.now()+60000) {
+    positions[0] = {...latest, position_source:'live'};
+  }
+  return positions;
 }
 
 function updateView(records) {
@@ -533,11 +562,13 @@ function updateView(records) {
   $('v-fix').textContent  = fmtFix(latest.fix);
   $('v-reg').textContent  = fmtReg(latest.reg_status);
 
-  /* Map uses matching analyzed observations only; never fall back to raw spikes. */
+  /* Historical route uses analysis; the newest stable fix can be previewed. */
   const analyzed = analyzedPositions(records);
-  const fixed = analyzed.filter(Boolean);
+  const fixed = displayPositions(records).filter(Boolean);
+  const livePreview = fixed.length && fixed[0].position_source === 'live';
   $('v-analysis').textContent = fixed.length
-    ? '분석 위치 표시 · 최신 관측은 다음 관측 후 반영 · 분석 '+fmtKst(fixed[0].analyzed_at)
+    ? livePreview ? '최신 안정성 확인 위치 · Hadoop 분석 대기'
+      : '분석 위치 표시 · 분석 '+fmtKst(fixed[0].analyzed_at)
     : '분석 결과 없음/불일치 · 위치 표시 보류';
 
   if (trackLine)    { trackLine.remove();    trackLine = null; }
@@ -571,7 +602,7 @@ function updateView(records) {
       className: 'latest-marker'
     }).addTo(map);
     latestMarker.bindTooltip(
-      (fixed[0].correction === 'interpolated_spike' ? '분석 보간 위치 (추정)' : '분석 위치 · 원본 유지') +
+      (livePreview ? '최신 관측 · 분석 대기' : fixed[0].correction === 'stationary_median' ? '정지 관측 대표 위치 (추정)' : fixed[0].correction === 'interpolated_spike' ? '분석 보간 위치 (추정)' : '분석 위치 · 원본 유지') +
       ' · '+fmtKst(fixed[0].ts_utc) +
       ' · 해발 고도 ' + fmtAltitude(fixed[0]) +
       ' · 속도 ' + fmt(fixed[0].speed_kmh, 'km/h', 1) +
@@ -580,12 +611,13 @@ function updateView(records) {
     );
 
     $('v-pos').textContent =
-      '최근 분석 위치 '+(fixed[0].correction === 'interpolated_spike' ? '(보간 추정) ' : '') +
+      (livePreview ? '최신 관측 위치 (분석 대기) ' : '최근 분석 위치 ')+(fixed[0].correction === 'stationary_median' ? '(정지 관측 대표값) ' : fixed[0].correction === 'interpolated_spike' ? '(보간 추정) ' : '') +
       pos[0].toFixed(5) + ', ' + pos[1].toFixed(5) +
       ' (' + ageText(Date.now() - parseTs(fixed[0].ts_utc)) + ' 픽스)';
 
     if (!fitted) {
-      map.fitBounds(trackLine.getBounds().pad(0.25));
+      if (analyzed.some(Boolean)) map.fitBounds(trackLine.getBounds().pad(0.25));
+      else map.setView(pos, 14);
       fitted = true;
     }
   } else {
@@ -627,9 +659,14 @@ function updateCountdown() {
 }
 
 /* ================= 수집 루프 ================= */
+let refreshInFlight = false;
 async function tick() {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(()=>controller.abort(), 12000);
   try {
-    const res = await fetch(gvizUrl(), { cache: 'no-store' });
+    const res = await fetch(gvizUrl(), { cache: 'no-store', signal:controller.signal });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const rows = parseGviz(await res.text());
     if (rows.length === 0) {
@@ -640,6 +677,9 @@ async function tick() {
   } catch (err) {
     console.warn('[livemap] 갱신 실패:', err);
     if (!hasData) showOverlay('error');
+  } finally {
+    clearTimeout(timeout);
+    refreshInFlight = false;
   }
 }
 
